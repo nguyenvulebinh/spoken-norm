@@ -2,7 +2,7 @@ import torch
 import matplotlib.pyplot as plt
 import numpy as np
 
-is_debug = True
+is_debug = False
 bias_input = None
 input_token = None
 output_token = []

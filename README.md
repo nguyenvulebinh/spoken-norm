@@ -106,3 +106,11 @@ for output in outputs.cpu().detach().numpy().tolist():
 ```
 
     28/4 cô vít bùng phát ở sờ cốt lờn chiếm 80 % là biến chủng đen ta và bê ta
+
+
+## Contact 
+
+nguyenvulebinh@gmail.com
+
+[![Follow](https://img.shields.io/twitter/follow/nguyenvulebinh?style=social)](https://twitter.com/intent/follow?screen_name=nguyenvulebinh)
+

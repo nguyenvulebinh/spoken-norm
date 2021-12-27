@@ -1,6 +1,6 @@
 torch==1.10.0
 sentencepiece==0.1.91
-transformers
-datasets
+transformers==4.12.5
+datasets==1.15.1
 sacrebleu
 jiwer

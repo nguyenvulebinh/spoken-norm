@@ -1,6 +1,11 @@
 # Transformation spoken text to written text
 
-![Alt text](./spoken_norm_model.svg)
+![Model architecture](./spoken_norm_model.svg)
+
+# Infer model
+
+- Play around at [Hugginface Space](https://huggingface.co/spaces/nguyenvulebinh/spoken-norm)
+
 
 ```python
 import torch
@@ -11,7 +16,7 @@ import os
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 ```
 
-# Init tokenizer and model
+## Init tokenizer and model
 
 
 ```python
@@ -20,7 +25,7 @@ model = EncoderDecoderSpokenNorm.from_pretrained('nguyenvulebinh/spoken-norm', c
 data_collator = DataCollatorForNormSeq2Seq(tokenizer)
 ```
 
-# Infer sample
+## Infer sample
 
 
 ```python
@@ -80,9 +85,3 @@ for output in outputs.cpu().detach().numpy().tolist():
 ```
 
     28/4 cô vít bùng phát ở sờ cốt lờn chiếm 80 % là biến chủng đen ta và bê ta
-
-
-
-```python
-
-```

@@ -1,29 +1,30 @@
 from transformers import Seq2SeqTrainingArguments, Seq2SeqTrainer, DataCollatorForSeq2Seq
 import os
 import model_handling
-import metric_handling
+# import metric_handling
 import data_handling
 import debug_cross_attention
+from trainer import SpokenNormTrainer
 
 debug_cross_attention.is_debug = False
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "4"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "4"
 
 if __name__ == "__main__":
     # init model
     model, tokenizer = model_handling.init_model()
 
     # init data
-    split_datasets = data_handling.init_data()
+    raw_datasets = data_handling.init_data()
 
-    tokenized_datasets = split_datasets.map(
-        data_handling.preprocess_function,
-        batched=True,
-        batch_size=4,
-        num_proc=4,
-        remove_columns=split_datasets["train"].column_names,
-        cache_file_names={"train": "./cache/train_datasets.arrow", "test": "./cache/test_datasets.arrow"}
-    )
+    # tokenized_datasets = split_datasets.map(
+    #     data_handling.preprocess_function,
+    #     batched=True,
+    #     batch_size=4,
+    #     num_proc=10,
+    #     remove_columns=split_datasets["train"].column_names,
+    #     cache_file_names={"train": "./cache/train_datasets.arrow", "test": "./cache/test_datasets.arrow"}
+    # )
 
     data_collator = data_handling.DataCollatorForNormSeq2Seq(tokenizer, model=model)
 
@@ -52,28 +53,30 @@ if __name__ == "__main__":
         warmup_ratio=1 / num_epochs,
         logging_dir=os.path.join(checkpoint_path, 'log'),
         overwrite_output_dir=True,
-        metric_for_best_model='wer',
-        greater_is_better=False,
+        # metric_for_best_model='wer',
+        # greater_is_better=False,
         # metric_for_best_model='bleu',
         # greater_is_better=True,
         eval_accumulation_steps=10,
-        dataloader_num_workers=2,  # 20 for full training
+        dataloader_num_workers=0,  # 20 for full training
+        generation_max_length=50,
         # sharded_ddp="simple",
         # local_rank=2,
         # fp16=True,
+        ignore_data_skip=True
     )
 
     # instantiate trainer
-    trainer = Seq2SeqTrainer(
+    trainer = SpokenNormTrainer(
         model=model,
         args=training_args,
-        compute_metrics=metric_handling.get_wer_metric_compute_fn(tokenizer),
-        train_dataset=tokenized_datasets['train'].shard(100, 0),
-        eval_dataset=tokenized_datasets['test'].shard(100, 0),
+        # compute_metrics=metric_handling.get_wer_metric_compute_fn(tokenizer),
+        train_dataset=raw_datasets['train'].shard(100, 0),
+        eval_dataset=raw_datasets['test'].shard(50, 0),
         data_collator=data_collator,
         tokenizer=tokenizer
     )
-
+    trainer.train()
     # trainer.evaluate()
     # trainer.save_model(checkpoint_path)
-    trainer.train()
+    # trainer.evaluate()

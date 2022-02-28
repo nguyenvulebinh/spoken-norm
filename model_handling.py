@@ -10,7 +10,8 @@ from transformers.modeling_outputs import Seq2SeqLMOutput, CausalLMOutputWithCro
     ModelOutput
 from attentions import ScaledDotProductAttention, MultiHeadAttention
 from collections import namedtuple
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
+from dataclasses import dataclass
 import random
 from model_config_handling import EncoderDecoderSpokenNormConfig, DecoderSpokenNormConfig, PretrainedConfig
 
@@ -20,6 +21,80 @@ model_name = 'nguyenvulebinh/envibert'
 if not os.path.exists(cache_dir):
     os.makedirs(cache_dir)
 logger = logging.get_logger(__name__)
+
+
+@dataclass
+class SpokenNormOutput(ModelOutput):
+    loss: Optional[torch.FloatTensor] = None
+    logits: torch.FloatTensor = None
+    logits_spoken_tagging: torch.FloatTensor = None
+    past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+    decoder_hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    decoder_attentions: Optional[Tuple[torch.FloatTensor]] = None
+    cross_attentions: Optional[Tuple[torch.FloatTensor]] = None
+    encoder_last_hidden_state: Optional[torch.FloatTensor] = None
+    encoder_hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    encoder_attentions: Optional[Tuple[torch.FloatTensor]] = None
+
+
+
+
+def collect_spoken_phrases_features(encoder_hidden_states, word_src_lengths, spoken_label):
+    list_features = []
+    list_features_mask = []
+    max_length = word_src_lengths.max()
+    feature_pad = torch.zeros_like(encoder_hidden_states[0, :1, :])
+    for hidden_state, word_length, list_idx in zip(encoder_hidden_states, word_src_lengths, spoken_label):
+        for idx in list_idx:
+            if idx > 0:
+                start = sum(word_length[:idx])
+                end = start + word_length[idx]
+                remain_length = max_length - word_length[idx]
+                list_features_mask.append(torch.cat([torch.ones_like(spoken_label[0, 0]).expand(word_length[idx]),
+                                                     torch.zeros_like(
+                                                         spoken_label[0, 0].expand(remain_length))]).unsqueeze(0))
+                spoken_phrases_feature = hidden_state[start: end]
+
+                list_features.append(torch.cat([spoken_phrases_feature,
+                                                feature_pad.expand(remain_length, feature_pad.size(-1))]).unsqueeze(0))
+    return torch.cat(list_features), torch.cat(list_features_mask)
+
+
+def collect_spoken_phrases_labels(decoder_input_ids, labels, labels_bias, word_tgt_lengths, spoken_idx):
+    list_decoder_input_ids = []
+    list_labels = []
+    list_labels_bias = []
+    max_length = word_tgt_lengths.max()
+    init_decoder_ids = torch.tensor([0], device=labels.device, dtype=labels.dtype)
+    pad_decoder_ids = torch.tensor([1], device=labels.device, dtype=labels.dtype)
+    eos_decoder_ids = torch.tensor([2], device=labels.device, dtype=labels.dtype)
+    none_labels_bias = torch.tensor([0], device=labels.device, dtype=labels.dtype)
+    ignore_labels_bias = torch.tensor([-100], device=labels.device, dtype=labels.dtype)
+
+    for decoder_inputs, decoder_label, decoder_label_bias, word_length, list_idx in zip(decoder_input_ids,
+                                                                                        labels, labels_bias,
+                                                                                        word_tgt_lengths, spoken_idx):
+        for idx in list_idx:
+            if idx > 0:
+                start = sum(word_length[:idx - 1])
+                end = start + word_length[idx - 1]
+                remain_length = max_length - word_length[idx - 1]
+                remain_decoder_input_ids = max_length - len(decoder_inputs[start + 1:end + 1])
+                list_decoder_input_ids.append(torch.cat([init_decoder_ids,
+                                                         decoder_inputs[start + 1:end + 1],
+                                                         pad_decoder_ids.expand(remain_decoder_input_ids)]).unsqueeze(0))
+                list_labels.append(torch.cat([decoder_label[start:end],
+                                              eos_decoder_ids,
+                                              ignore_labels_bias.expand(remain_length)]).unsqueeze(0))
+                list_labels_bias.append(torch.cat([decoder_label_bias[start:end],
+                                                   none_labels_bias,
+                                                   ignore_labels_bias.expand(remain_length)]).unsqueeze(0))
+
+    decoder_input_ids = torch.cat(list_decoder_input_ids)
+    labels = torch.cat(list_labels)
+    labels_bias = torch.cat(list_labels_bias)
+
+    return decoder_input_ids, labels, labels_bias
 
 
 class EncoderDecoderSpokenNorm(EncoderDecoderModel):
@@ -89,6 +164,11 @@ class EncoderDecoderSpokenNorm(EncoderDecoderModel):
             raise ValueError(
                 f"The encoder {self.encoder} should not have a LM Head. Please use a model without LM Head"
             )
+
+        # spoken tagging
+        self.dropout = torch.nn.Dropout(0.3)
+        # 0: "O", 1: "B", 2: "I"
+        self.spoken_tagging_classifier = torch.nn.Linear(config.encoder.hidden_size, 3)
 
         # tie encoder, decoder weights if config set accordingly
         self.tie_weights()
@@ -187,6 +267,8 @@ class EncoderDecoderSpokenNorm(EncoderDecoderModel):
                     return_dict=True,
                     output_attentions=False,
                     output_hidden_states=False,
+                    word_src_lengths=None,
+                    spoken_idx=None,
                     **kwargs_encoder):
             encoder_outputs = self.encoder(
                 input_ids=input_ids,
@@ -197,33 +279,72 @@ class EncoderDecoderSpokenNorm(EncoderDecoderModel):
                 return_dict=return_dict,
                 **kwargs_encoder,
             )
+            encoder_outputs.word_src_lengths = word_src_lengths
+            encoder_outputs.spoken_tagging_output = self.spoken_tagging_classifier(self.dropout(encoder_outputs[0]))
+            if spoken_idx is not None:
+                encoder_outputs.spoken_idx = spoken_idx
+            else:
+                pass
 
-            d = {
-                "encoder_bias_outputs": None,
-                "bias_attention_mask": None,
-                "last_hidden_state": None,
-                "pooler_output": None
-
-            }
-            encoder_bias_outputs = namedtuple('Struct', d.keys())(*d.values())
-            if bias_input_ids is not None:
-                encoder_bias_outputs = self.encoder(
-                    input_ids=bias_input_ids,
-                    attention_mask=bias_attention_mask,
-                    inputs_embeds=None,
-                    output_attentions=output_attentions,
-                    output_hidden_states=output_hidden_states,
-                    return_dict=return_dict,
-                    **kwargs_encoder,
-                )
-                encoder_bias_outputs.bias_attention_mask = bias_attention_mask
-
+            encoder_bias_outputs = self.forward_bias(bias_input_ids,
+                                                     bias_attention_mask,
+                                                     output_attentions=output_attentions,
+                                                     return_dict=return_dict,
+                                                     output_hidden_states=output_hidden_states,
+                                                     **kwargs_encoder)
+            # d = {
+            #     "encoder_bias_outputs": None,
+            #     "bias_attention_mask": None,
+            #     "last_hidden_state": None,
+            #     "pooler_output": None
+            #
+            # }
+            # encoder_bias_outputs = namedtuple('Struct', d.keys())(*d.values())
+            # if bias_input_ids is not None:
+            #     encoder_bias_outputs = self.encoder(
+            #         input_ids=bias_input_ids,
+            #         attention_mask=bias_attention_mask,
+            #         inputs_embeds=None,
+            #         output_attentions=output_attentions,
+            #         output_hidden_states=output_hidden_states,
+            #         return_dict=return_dict,
+            #         **kwargs_encoder,
+            #     )
+            #     encoder_bias_outputs.bias_attention_mask = bias_attention_mask
             return encoder_outputs, encoder_bias_outputs
 
         return forward
 
+    def forward_bias(self,
+                     bias_input_ids,
+                     bias_attention_mask,
+                     output_attentions=False,
+                     return_dict=True,
+                     output_hidden_states=False,
+                     **kwargs_encoder):
+        d = {
+            "encoder_bias_outputs": None,
+            "bias_attention_mask": None,
+            "last_hidden_state": None,
+            "pooler_output": None
+
+        }
+        encoder_bias_outputs = namedtuple('Struct', d.keys())(*d.values())
+        if bias_input_ids is not None:
+            encoder_bias_outputs = self.encoder(
+                input_ids=bias_input_ids,
+                attention_mask=bias_attention_mask,
+                inputs_embeds=None,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                **kwargs_encoder,
+            )
+            encoder_bias_outputs.bias_attention_mask = bias_attention_mask
+        return encoder_bias_outputs
+
     def _prepare_encoder_decoder_kwargs_for_generation(
-            self, input_ids: torch.LongTensor, model_kwargs
+            self, input_ids: torch.LongTensor, model_kwargs, model_input_name
     ) -> Dict[str, Any]:
         if "encoder_outputs" not in model_kwargs:
             # retrieve encoder hidden states
@@ -236,7 +357,23 @@ class EncoderDecoderSpokenNorm(EncoderDecoderModel):
             encoder_outputs, encoder_bias_outputs = encoder(input_ids, return_dict=True, **encoder_kwargs)
             model_kwargs["encoder_outputs"]: ModelOutput = encoder_outputs
             model_kwargs["encoder_bias_outputs"]: ModelOutput = encoder_bias_outputs
+
         return model_kwargs
+
+    def _prepare_decoder_input_ids_for_generation(
+            self,
+            batch_size: int,
+            decoder_start_token_id: int = None,
+            bos_token_id: int = None,
+            model_kwargs: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> torch.LongTensor:
+
+        if model_kwargs is not None and "decoder_input_ids" in model_kwargs:
+            return model_kwargs.pop("decoder_input_ids")
+        else:
+            decoder_start_token_id = self._get_decoder_start_token_id(decoder_start_token_id, bos_token_id)
+            num_spoken_phrases = (model_kwargs['encoder_outputs'].spoken_idx >= 0).view(-1).sum()
+            return torch.ones((num_spoken_phrases, 1), dtype=torch.long, device=self.device) * decoder_start_token_id
 
     def prepare_inputs_for_generation(
             self, input_ids, past=None, attention_mask=None, use_cache=None, encoder_outputs=None, **kwargs
@@ -270,12 +407,17 @@ class EncoderDecoderSpokenNorm(EncoderDecoderModel):
             decoder_inputs_embeds=None,
             labels=None,
             use_cache=None,
+            spoken_label=None,
+            word_src_lengths=None,
+            word_tgt_lengths=None,
+            spoken_idx=None,
             output_attentions=None,
             output_hidden_states=None,
             return_dict=None,
             inputs_length=None,
             outputs=None,
             outputs_length=None,
+            text=None,
             **kwargs,
     ):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
@@ -285,7 +427,7 @@ class EncoderDecoderSpokenNorm(EncoderDecoderModel):
         kwargs_decoder = {
             argument[len("decoder_"):]: value for argument, value in kwargs.items() if argument.startswith("decoder_")
         }
-
+        spoken_tagging_output = None
         if encoder_outputs is None:
             encoder_outputs = self.encoder(
                 input_ids=input_ids,
@@ -296,6 +438,10 @@ class EncoderDecoderSpokenNorm(EncoderDecoderModel):
                 return_dict=return_dict,
                 **kwargs_encoder,
             )
+            spoken_tagging_output = self.spoken_tagging_classifier(self.dropout(encoder_outputs[0]))
+        # else:
+        #     word_src_lengths = encoder_outputs.word_src_lengths
+        #     spoken_tagging_output = encoder_outputs.spoken_tagging_output
 
         if encoder_bias_outputs is None:
             encoder_bias_outputs = self.encoder(
@@ -311,6 +457,15 @@ class EncoderDecoderSpokenNorm(EncoderDecoderModel):
 
         encoder_hidden_states = encoder_outputs[0]
 
+        if spoken_idx is not None:
+            encoder_hidden_states, attention_mask = collect_spoken_phrases_features(encoder_hidden_states,
+                                                                                    word_src_lengths,
+                                                                                    spoken_idx)
+
+            decoder_input_ids, labels, labels_bias = collect_spoken_phrases_labels(decoder_input_ids,
+                                                                                   labels, labels_bias,
+                                                                                   word_tgt_lengths,
+                                                                                   spoken_idx)
         # optionally project encoder_hidden_states
         if (
                 self.encoder.config.hidden_size != self.decoder.config.hidden_size
@@ -352,22 +507,28 @@ class EncoderDecoderSpokenNorm(EncoderDecoderModel):
             loss = loss_fct(logits.reshape(-1, self.decoder.config.vocab_size), labels.view(-1))
             loss = loss + decoder_outputs.loss
 
+        if spoken_label is not None:
+            loss_fct = CrossEntropyLoss()
+            spoken_tagging_loss = loss_fct(spoken_tagging_output.reshape(-1, 3), spoken_label.view(-1))
+            loss = loss + spoken_tagging_loss
+
         if not return_dict:
             if loss is not None:
                 return (loss,) + decoder_outputs + encoder_outputs
             else:
                 return decoder_outputs + encoder_outputs
 
-        return Seq2SeqLMOutput(
+        return SpokenNormOutput(
             loss=loss,
             logits=decoder_outputs.logits,
+            logits_spoken_tagging=spoken_tagging_output,
             past_key_values=decoder_outputs.past_key_values,
             decoder_hidden_states=decoder_outputs.hidden_states,
             decoder_attentions=decoder_outputs.attentions,
             cross_attentions=decoder_outputs.cross_attentions,
-            encoder_last_hidden_state=encoder_outputs.last_hidden_state,
-            encoder_hidden_states=encoder_outputs.hidden_states,
-            encoder_attentions=encoder_outputs.attentions,
+            # encoder_last_hidden_state=encoder_outputs.last_hidden_state,
+            # encoder_hidden_states=encoder_outputs.hidden_states,
+            # encoder_attentions=encoder_outputs.attentions,
         )
 
 
@@ -377,10 +538,10 @@ class DecoderSpokenNorm(RobertaForCausalLM):
     # Copied from transformers.models.bert.modeling_bert.BertModel.__init__ with Bert->Roberta
     def __init__(self, config):
         super().__init__(config)
-        self.dense_query_bias = torch.nn.Linear(config.hidden_size, config.hidden_size)
+        self.dense_query_copy = torch.nn.Linear(config.hidden_size, config.hidden_size)
         self.mem_no_entry = Parameter(torch.randn(config.hidden_size).unsqueeze(0))
-        # self.bias_attention_layer = ScaledDotProductAttention(config.hidden_size)
         self.bias_attention_layer = MultiHeadAttention(config.hidden_size)
+        self.copy_attention_layer = MultiHeadAttention(config.hidden_size)
 
     def forward_bias_attention(self, query, values, values_mask):
         """
@@ -400,6 +561,20 @@ class DecoderSpokenNorm(RobertaForCausalLM):
                                                                       value=values,
                                                                       mask=values_mask.bool())
         result_attention = result_attention.squeeze(1).view(batch, output_steps, hidden_state)
+        return result_attention
+
+    def forward_copy_attention(self, query, values, values_mask):
+        """
+        :param query: batch * output_steps * hidden_state
+        :param values: batch * max_encoder_steps * hidden_state
+        :param values_mask: batch * output_steps * max_encoder_steps
+        :return: batch * output_steps * hidden_state
+        """
+        dot_attn_score = torch.bmm(query, values.transpose(2, 1))
+        attn_mask = (1 - values_mask.clone().unsqueeze(1)).bool()
+        dot_attn_score.masked_fill_(attn_mask, -float('inf'))
+        dot_attn_score = torch.softmax(dot_attn_score, dim=-1)
+        result_attention = torch.bmm(dot_attn_score, values)
         return result_attention
 
     def forward(
@@ -447,6 +622,13 @@ class DecoderSpokenNorm(RobertaForCausalLM):
         # Query for bias
         sequence_output = outputs[0]
         bias_indicate_output = None
+
+        # output copy attention
+        query_copy = torch.relu(self.dense_query_copy(sequence_output))
+        sequence_atten_copy_output = self.forward_copy_attention(query_copy,
+                                                                 encoder_hidden_states,
+                                                                 encoder_attention_mask)
+
         if encoder_bias_pooling is not None:
 
             # Make bias features
@@ -468,16 +650,8 @@ class DecoderSpokenNorm(RobertaForCausalLM):
                 if random.random() < 0.5:
                     bias_indicate_output = labels_bias.clone()
                     bias_indicate_output[torch.where(bias_indicate_output < 0)] = 0
-
                 else:
                     bias_indicate_output = torch.argmax(bias_ranking_score, dim=-1)
-
-            # random mask input features
-            if self.training:
-                mask_indicate_output = bias_indicate_output.clone()
-                mask_indicate_output[torch.where(mask_indicate_output > 0)] = 1
-                if random.random() < 0.5:
-                    sequence_output = sequence_output * (1 - mask_indicate_output.unsqueeze(-1).repeat(1, 1, h))
 
             # Bias encoder hidden state
             _, max_len, _ = encoder_bias_hidden_states.size()
@@ -494,9 +668,9 @@ class DecoderSpokenNorm(RobertaForCausalLM):
                                                                      bias_encoder_attention_mask)
 
             # Find output words
-            prediction_scores = self.lm_head(sequence_output + sequence_atten_bias_output)
+            prediction_scores = self.lm_head(sequence_output + sequence_atten_bias_output + sequence_atten_copy_output)
         else:
-            prediction_scores = self.lm_head(sequence_output)
+            prediction_scores = self.lm_head(sequence_output + sequence_atten_copy_output)
 
         # run attention with bias
 
